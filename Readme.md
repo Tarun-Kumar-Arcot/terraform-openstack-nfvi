@@ -6,6 +6,80 @@ Includes a full local development setup guide using LXD + DevStack on Fedora Lin
 
 ---
 
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  jarvis (Fedora 42)  ·  host IP: <HOST_IP>                    │
+│                                                                  │
+│       ┌──────────────────────────────────┐                       │
+│       │           Terraform              │                       │
+│       │   openstack provider v2.0        │                       │
+│       │         main.tf                  │                       │
+│       └─────────────┬────────────────────┘                       │
+└─────────────────────┼────────────────────────────────────────────┘
+                      │ HTTP/REST via lxdbr0 bridge
+┌─────────────────────┼────────────────────────────────────────────┐
+│  devstack-vm (Ubuntu 24.04)  ·  <DEVSTACK_VM_IP>                   │
+│                      │                                           │
+│   ┌──────────────────┼───────────────────────────────────────┐   │
+│   │  ┌─────────┐     │   ┌──────────┐        ┌───────────┐   │   │
+│   │  │Keystone │ ────┤──▶│ Neutron  │───────▶│  OVN+OVS  │   │   │
+│   │  │  (1)    │     │   │   (2)    │        │    (3)    │   │   │
+│   │  │Identity │     │   │ ML2/OVN  │        │ Data plane│   │   │
+│   │  └─────────┘     │   └──────────┘        └───────────┘   │   │
+│   └──────────────────┼───────────────────────────────────────┘   │
+└─────────────────────┼────────────────────────────────────────────┘
+                      │
+           ┌──────────┴──────────┐
+           │                     │
+┌──────────────────┐   ┌──────────────────┐
+│tenant-alpha-net  │   │ tenant-beta-net  │
+│ VNI: 10100       │   │ VNI: 10200       │
+│ 10.100.10.0/24   │   │ 10.200.10.0/24   │
+│ VRF_ALPHA        │   │ VRF_BETA         │
+└──────────────────┘   └──────────────────┘
+```
+
+### Components
+
+| Component | Role | Details |
+|---|---|---|
+| **Terraform** | IaC control plane | Runs on jarvis host. Reads `main.tf`, calls OpenStack provider, records state in `terraform.tfstate` |
+| **LXD bridge (lxdbr0)** | Virtual network | Connects jarvis host to devstack-vm at `<LXD_BRIDGE_SUBNET>`. Provides NAT for outbound internet from VM |
+| **Keystone** | Identity service `(1)` | Validates credentials (`admin/admin123`, domain `Default`, region `RegionOne`). Returns an auth token for all subsequent API calls |
+| **Neutron** | Networking API `(2)` | Accepts REST calls to create/list/delete networks and subnets. Uses ML2 plugin with OVN as the mechanism driver. Persists resource records to MariaDB |
+| **OVN + OVS** | Data plane `(3)` | Open Virtual Network programs Open vSwitch with Geneve-encapsulated flows. Translates Neutron's logical network model into actual packet forwarding rules in the Northbound/Southbound databases |
+| **Tenant networks** | Output | Two isolated NFVI segments with explicit VNI assignments. DHCP disabled — IP assignment is managed externally by the MANO layer |
+
+### Data flow
+
+When you run `terraform apply`, the following sequence happens:
+
+```
+1.  Terraform reads provider block → credentials, auth_url, region
+2.  POST /identity/v3/auth/tokens   → Keystone validates credentials
+3.  Keystone returns X-Auth-Token header
+4.  POST /v2.0/networks             → Neutron creates tenant-enterprise-alpha-net
+    body: { network_type: geneve, segmentation_id: 10100 }
+5.  POST /v2.0/networks             → Neutron creates tenant-enterprise-beta-net
+    body: { network_type: geneve, segmentation_id: 10200 }
+6.  Neutron ML2/OVN driver → OVN Northbound DB creates logical switch per network
+7.  OVN Southbound DB programs OVS flows on each compute node
+8.  POST /v2.0/subnets × 2         → Neutron creates subnets with CIDRs
+9.  Neutron returns UUIDs for all 4 resources
+10. Terraform writes UUIDs to terraform.tfstate
+11. Output block prints allocated_vim_segments map
+```
+
+### Why Geneve instead of VXLAN
+
+The original Terraform file used `network_type = "vxlan"`. OpenStack with OVN as the mechanism driver uses Geneve as its tunnel encapsulation protocol. OVN does not support the legacy ML2/OVS VXLAN type driver. The segmentation IDs (VNIs), CIDR allocation, and all other behaviour are identical — only the encapsulation protocol label changes.
+
+This reflects Red Hat's product direction: RHOSP 17.1 is the last release supporting ML2/OVS. RHOSO 18.0 (Red Hat OpenStack Services on OpenShift) mandates OVN exclusively.
+
+---
+
 ## What This Provisions
 
 Two isolated tenant network segments with explicit VNI assignments:
@@ -15,7 +89,7 @@ Two isolated tenant network segments with explicit VNI assignments:
 | tenant-enterprise-alpha | 10100 | VRF_ALPHA | 10.100.10.0/24 |
 | tenant-enterprise-beta | 10200 | VRF_BETA | 10.200.10.0/24 |
 
-Each tenant gets a dedicated Neutron network (Geneve encapsulation, OVN-backed) and a subnet with DHCP disabled — appropriate for NFVI data plane segments managed externally.
+Each tenant gets a dedicated Neutron network (Geneve encapsulation, OVN-backed) and a subnet with DHCP disabled — appropriate for NFVI data plane segments managed externally by a MANO layer.
 
 ---
 
@@ -79,7 +153,7 @@ networks:
 - name: lxdbr0
   type: bridge
   config:
-    ipv4.address: 10.147.165.1/24
+    ipv4.address: <HOST_IP>/24
     ipv4.nat: "true"
     ipv6.address: none
 storage_pools:
@@ -121,7 +195,7 @@ sleep 30 && lxc list devstack-vm
 
 ### 1.4 Assign Static IP to VM
 
-The LXD bridge IP range is `10.147.165.0/24`. Assign a static IP inside the VM:
+The LXD bridge IP range is `<LXD_BRIDGE_SUBNET>`. Assign a static IP inside the VM:
 
 ```bash
 lxc exec devstack-vm -- bash -c "cat > /etc/netplan/99-static.yaml << 'EOF'
@@ -131,10 +205,10 @@ network:
     enp5s0:
       dhcp4: false
       addresses:
-        - 10.147.165.100/24
+        - <DEVSTACK_VM_IP>/24
       routes:
         - to: default
-          via: 10.147.165.1
+          via: <HOST_IP>
       nameservers:
         addresses: [8.8.8.8, 1.1.1.1]
 EOF"
@@ -142,9 +216,8 @@ EOF"
 lxc exec devstack-vm -- chmod 600 /etc/netplan/99-static.yaml
 lxc exec devstack-vm -- netplan apply
 
-# Verify
+# Verify — IPV4 column should show <DEVSTACK_VM_IP>
 lxc list devstack-vm
-# IPV4 column should show 10.147.165.100
 ```
 
 ### 1.5 Set Up DevStack Inside the VM
@@ -178,7 +251,7 @@ DATABASE_PASSWORD=admin123
 RABBIT_PASSWORD=admin123
 SERVICE_PASSWORD=admin123
 
-HOST_IP=10.147.165.100
+HOST_IP=<DEVSTACK_VM_IP>
 
 # Disable unused services to reduce RAM and install time
 disable_service tempest
@@ -214,8 +287,8 @@ EOF
 Install takes 20–40 minutes. Successful completion shows:
 
 ```
-Keystone is serving at http://10.147.165.100/identity/
-2026-XX-XX XX:XX:XX | stack.sh completed in XXX seconds.
+Keystone is serving at http://<DEVSTACK_VM_IP>/identity/
+stack.sh completed in XXX seconds.
 ```
 
 ---
@@ -234,8 +307,8 @@ terraform version
 ### 2.2 Verify Connectivity to OpenStack API
 
 ```bash
-ping -c 3 10.147.165.100
-curl -s http://10.147.165.100/identity/v3 | python3 -m json.tool | head -10
+ping -c 3 <DEVSTACK_VM_IP>
+curl -s http://<DEVSTACK_VM_IP>/identity/v3 | python3 -m json.tool | head -10
 ```
 
 The curl should return a JSON `version` block confirming Keystone is reachable from the host.
@@ -246,10 +319,10 @@ The provider block targets your local DevStack instance:
 
 ```hcl
 provider "openstack" {
-  auth_url    = "http://10.147.165.100/identity/v3"
+  auth_url    = "http://<DEVSTACK_VM_IP>/identity/v3"
   region      = "RegionOne"
   user_name   = "admin"
-  password    = "admin123"
+  password    = "admin123"   # Local DevStack only. Use OS_PASSWORD env var in production.
   tenant_name = "admin"
   domain_name = "Default"
   insecure    = true
@@ -271,17 +344,11 @@ terraform init
 # Validate HCL syntax
 terraform validate
 
-# Preview what will be created — review before applying
-terraform plan
-
 # Save plan to file (best practice for approval gates)
 terraform plan -out=tfplan
 
 # Apply saved plan
 terraform apply tfplan
-
-# Or apply interactively
-terraform apply
 ```
 
 ---
@@ -291,13 +358,8 @@ terraform apply
 ### From Terraform
 
 ```bash
-# List all managed resources
 terraform state list
-
-# Full state dump with all attributes
 terraform show
-
-# Just the network UUID output
 terraform output allocated_vim_segments
 ```
 
@@ -311,8 +373,6 @@ openstack network list
 openstack network show tenant-enterprise-alpha-net
 openstack network show tenant-enterprise-beta-net
 openstack subnet list
-openstack subnet show tenant-enterprise-alpha-subnet
-openstack subnet show tenant-enterprise-beta-subnet
 ```
 
 ### Expected State
@@ -321,7 +381,7 @@ Both networks should show:
 
 ```
 | provider:network_type     | geneve  |
-| provider:segmentation_id  | 10100   |  (or 10200)
+| provider:segmentation_id  | 10100   |
 | status                    | ACTIVE  |
 ```
 
@@ -334,9 +394,7 @@ Both networks should show:
 terraform destroy
 
 # Stop DevStack (inside VM)
-lxc exec devstack-vm -- bash
-su - stack
-cd /opt/stack/devstack && ./unstack.sh
+lxc exec devstack-vm -- bash -c "su - stack -c 'cd /opt/stack/devstack && ./unstack.sh'"
 
 # Delete the VM entirely
 lxc delete devstack-vm --force
@@ -344,45 +402,16 @@ lxc delete devstack-vm --force
 
 ---
 
-## Architecture Notes
-
-### Why Geneve Instead of VXLAN
-
-The original Terraform file used `network_type = "vxlan"`. DevStack master defaults to OVN as the ML2 mechanism driver. OVN uses Geneve for tenant tunnel encapsulation internally. The legacy ML2/OVS agent (`q-agt`) that supported VXLAN directly conflicts with OVN and was removed in this configuration.
-
-This aligns with Red Hat's product direction: RHOSP 17.1 is the last release supporting ML2/OVS, and RHOSO 18.0 (OpenStack Services on OpenShift) mandates OVN exclusively.
-
-### Segment IDs
-
-VNIs 10100 and 10200 fall within the configured `vni_ranges = 10000:20000`. If you extend this configuration, ensure new segment IDs stay within this range or update the range in `local.conf` and restart neutron-server.
-
-### MTU
-
-Both networks show `mtu = 1442`. Geneve adds a 58-byte header overhead versus standard 1500 MTU — this is correct and expected for tunnelled overlay networks.
-
----
-
 ## Troubleshooting
 
-### DevStack fails with `FORCE=yes` required
-
-Ubuntu 22.04 (jammy) is no longer in DevStack master's supported distro list. Use Ubuntu 24.04 (noble) instead. Recreate the LXD VM with `lxc launch ubuntu:24.04`.
-
-### `q-agt/neutron-agt service must be disabled with OVN`
-
-Our `local.conf` enabled the legacy OVS ML2 agent alongside OVN services (which are DevStack master defaults). Fix: add `disable_service q-agt q-dhcp q-l3 q-meta` to `local.conf` and run `./unstack.sh` before retrying `./stack.sh`.
-
-### VM has no IPv4 address
-
-LXD's DHCP from `lxdbr0` can be unreliable for VMs. Assign a static IP via netplan inside the VM (see Section 1.4). Ubuntu 24.04 uses systemd-networkd, not dhclient — running `dhclient` manually will hang.
-
-### `lxd init` fails with `Pool source cannot be changed`
-
-LXD was already initialised from a previous setup. Check `lxc storage list` and `lxc network list`. If the `default` pool and `lxdbr0` bridge exist and are in `CREATED` state, skip `lxd init` entirely and proceed to VM creation.
-
-### Permission denied on LXD socket
-
-Do not use `sudo` with `lxd`/`lxc` commands. Add your user to the `lxd` group: `sudo usermod -aG lxd $USER && newgrp lxd`.
+| Error | Cause | Fix |
+|---|---|---|
+| `FORCE=yes` required | Ubuntu 22.04 dropped from DevStack master supported distros | Recreate VM with `lxc launch ubuntu:24.04` |
+| `q-agt must be disabled with OVN` | Legacy OVS agent conflicts with OVN default | Add `disable_service q-agt q-dhcp q-l3 q-meta` to `local.conf`, run `./unstack.sh` then retry |
+| VM has no IPv4 | LXD DHCP unreliable for VMs; Ubuntu 24.04 uses systemd-networkd | Apply static IP via netplan (see Section 1.4). Never run `dhclient` manually |
+| `Pool source cannot be changed` | LXD already initialised from previous setup | Skip `lxd init` — check `lxc storage list` and `lxc network list` instead |
+| `Permission denied` on LXD socket | Wrong — do not use `sudo` with lxd/lxc | `sudo usermod -aG lxd $USER && newgrp lxd` |
+| `flag needs an argument: -out` | `-out` requires a filename argument | Use `terraform plan -out=tfplan` |
 
 ---
 
@@ -390,5 +419,5 @@ Do not use `sudo` with `lxd`/`lxc` commands. Add your user to the `lxd` group: `
 
 - [DevStack Documentation](https://docs.openstack.org/devstack/latest/)
 - [Terraform OpenStack Provider](https://registry.terraform.io/providers/terraform-provider-openstack/openstack/latest)
-- [Red Hat OpenStack Services on OpenShift (RHOSO 18.0)](https://docs.redhat.com/en/documentation/red_hat_openstack_services_on_openshift/18.0)
+- [Red Hat OpenStack Services on OpenShift 18.0](https://docs.redhat.com/en/documentation/red_hat_openstack_services_on_openshift/18.0)
 - [OVN Architecture](https://docs.ovn.org/en/latest/topics/architecture.html)
